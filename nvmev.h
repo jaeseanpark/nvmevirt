@@ -14,6 +14,7 @@
 
 #undef CONFIG_NVMEV_VERBOSE
 #undef CONFIG_NVMEV_DEBUG_VERBOSE
+#undef CONFIG_NVMEV_COMP_DEBUG
 
 /*************************/
 #define NVMEV_DRV_NAME "NVMeVirt"
@@ -26,6 +27,12 @@
 #define NVMEV_DEBUG(string, args...) printk(KERN_INFO "%s: " string, NVMEV_DRV_NAME, ##args)
 #else
 #define NVMEV_DEBUG(string, args...)
+#endif
+
+#ifdef CONFIG_NVMEV_COMP_DEBUG
+#define COMP_DEBUG(string, args...) printk(KERN_INFO "%s: " string, NVMEV_DRV_NAME, ##args)
+#else
+#define COMP_DEBUG(string, args...)
 #endif
 
 #define NR_MAX_IO_QUEUE 72
