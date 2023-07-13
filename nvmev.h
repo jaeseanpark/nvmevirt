@@ -13,11 +13,12 @@
 #undef CONFIG_NVMEV_FAST_X86_IRQ_HANDLING
 
 #undef CONFIG_NVMEV_VERBOSE
-#undef CONFIG_NVMEV_DEBUG_VERBOSE
-#undef CONFIG_NVMEV_COMP_DEBUG
+#define CONFIG_NVMEV_DEBUG_VERBOSE
+#define CONFIG_NVMEV_COMP_DEBUG
 
 /*************************/
 #define NVMEV_DRV_NAME "NVMeVirt"
+#define COMP "COMP"
 
 #define NVMEV_INFO(string, args...) printk(KERN_INFO "%s: " string, NVMEV_DRV_NAME, ##args)
 #define NVMEV_ERROR(string, args...) printk(KERN_ERR "%s: " string, NVMEV_DRV_NAME, ##args)
@@ -30,7 +31,7 @@
 #endif
 
 #ifdef CONFIG_NVMEV_COMP_DEBUG
-#define COMP_DEBUG(string, args...) printk(KERN_INFO "%s: " string, NVMEV_DRV_NAME, ##args)
+#define COMP_DEBUG(string, args...) printk(KERN_INFO "%s: " string, COMP, ##args)
 #else
 #define COMP_DEBUG(string, args...)
 #endif
