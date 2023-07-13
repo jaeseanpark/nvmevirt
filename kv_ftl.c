@@ -3,6 +3,7 @@
 #include <linux/ktime.h>
 #include <linux/highmem.h>
 #include <linux/sched/clock.h>
+#include <linux/zstd.h>
 
 #include "nvmev.h"
 #include "kv_ftl.h"
@@ -75,6 +76,9 @@ static unsigned long long __schedule_io_units(int opcode, unsigned long lba, uns
 		delay = nvmev_vdev->config.write_delay;
 		latency = nvmev_vdev->config.write_time;
 		trailing = nvmev_vdev->config.write_trailing;
+		//NOTE - debug
+		NVMEV_DEBUG("delay:%ld latency:%ld trailing:%ld\n", delay, latency, trailing);
+		//COMP_DEBUG("schedule_io_units: delay:%ld latency:%ld trailing:%ld\n", delay, latency, trailing);
 	} else if (opcode == nvme_cmd_read || opcode == nvme_cmd_kv_retrieve) {
 		delay = nvmev_vdev->config.read_delay;
 		latency = nvmev_vdev->config.read_time;
@@ -512,10 +516,11 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 			new_offset = allocate_mem_offset(kv_ftl, cmd);
 			offset = new_offset;
 			is_insert = 1; // is insert
-
-			NVMEV_DEBUG("kv_store insert %s %llu\n", cmd.kv_store.key, offset);
+			NVMEV_DEBUG("kv_store insert %s %llu, length %ld\n", cmd.kv_store.key,
+				    offset, length);
 		} else {
-			NVMEV_DEBUG("kv_store update %s %llu\n", cmd.kv_store.key, offset);
+			NVMEV_DEBUG("kv_store update %s %llu, length %ld\n", cmd.kv_store.key,
+				    offset, length);
 
 			if (length != entry.length) {
 				if (length <= SMALL_LENGTH && entry.length <= SMALL_LENGTH) {
@@ -591,15 +596,21 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 		vaddr = kmap_atomic_pfn(PRP_PFN(paddr));
 
 		io_size = min_t(size_t, remaining, PAGE_SIZE);
+		COMP_DEBUG("remaining: %ld, page: %ld, io_size: %ld\n", remaining, PAGE_SIZE,
+			   io_size);
 
+		/* page offset mask = 1111 1111 1111 */
 		if (paddr & PAGE_OFFSET_MASK) { // 일반 block io면 언제 여기에 해당?
 			mem_offs = paddr & PAGE_OFFSET_MASK;
 			if (io_size + mem_offs > PAGE_SIZE)
 				io_size = PAGE_SIZE - mem_offs;
 		}
 		if (cmd.common.opcode == nvme_cmd_kv_store) {
+			/* TODO: implement compression */
+			COMP_DEBUG("memcpy, io_size: %ld\n", io_size);
 			memcpy(nvmev_vdev->storage_mapped + offset, vaddr + mem_offs, io_size);
 		} else if (cmd.common.opcode == nvme_cmd_kv_retrieve) {
+			/* TODO: implement decompression */
 			memcpy(vaddr + mem_offs, nvmev_vdev->storage_mapped + offset, io_size);
 		} else {
 			NVMEV_ERROR("Wrong KV Command passed to NVMeVirt!!\n");
@@ -783,8 +794,7 @@ static unsigned int __do_perform_kv_batch(struct kv_ftl *kv_ftl, struct nvme_kv_
 	return 0;
 }
 
-unsigned int kv_iter_open(struct kv_ftl *kv_ftl, struct nvme_kv_command cmd,
-				 unsigned int *status)
+unsigned int kv_iter_open(struct kv_ftl *kv_ftl, struct nvme_kv_command cmd, unsigned int *status)
 {
 	int iter = 0;
 	bool flag = false;
@@ -812,8 +822,7 @@ unsigned int kv_iter_open(struct kv_ftl *kv_ftl, struct nvme_kv_command cmd,
 	return iter;
 }
 
-unsigned int kv_iter_close(struct kv_ftl *kv_ftl, struct nvme_kv_command cmd,
-				  unsigned int *status)
+unsigned int kv_iter_close(struct kv_ftl *kv_ftl, struct nvme_kv_command cmd, unsigned int *status)
 {
 	int iter = cmd.kv_iter_req.iter_handle;
 
@@ -977,7 +986,7 @@ bool kv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struct 
 		break;
 	default:
 		NVMEV_ERROR("%s: unimplemented command: %s(%d)\n", __func__,
-			   nvme_opcode_string(cmd->common.opcode), cmd->common.opcode);
+			    nvme_opcode_string(cmd->common.opcode), cmd->common.opcode);
 		break;
 	}
 
@@ -989,8 +998,7 @@ bool kv_identify_nvme_io_cmd(struct nvmev_ns *ns, struct nvme_command cmd)
 	return is_kv_cmd(cmd.common.opcode);
 }
 
-unsigned int kv_perform_nvme_io_cmd(struct nvmev_ns *ns, struct nvme_command *cmd,
-					   uint32_t *status)
+unsigned int kv_perform_nvme_io_cmd(struct nvmev_ns *ns, struct nvme_command *cmd, uint32_t *status)
 {
 	struct kv_ftl *kv_ftl = (struct kv_ftl *)ns->ftls;
 	struct nvme_kv_command *kv_cmd = (struct nvme_kv_command *)cmd;
