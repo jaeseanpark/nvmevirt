@@ -39,6 +39,8 @@
 #define NR_MAX_IO_QUEUE 72
 #define NR_MAX_PARALLEL_IO 16384
 
+#define NVMEV_INTX_IRQ 15
+
 #define PAGE_OFFSET_MASK (PAGE_SIZE - 1)
 #define PRP_PFN(x) ((unsigned long)((x) >> PAGE_SHIFT))
 
@@ -74,7 +76,7 @@ struct nvmev_sq_stat {
 struct nvmev_submission_queue {
 	int qid;
 	int cqid;
-	int sq_priority;
+	int priority;
 	bool phys_contig;
 
 	int queue_size;
@@ -203,7 +205,7 @@ struct nvmev_dev {
 
 	struct pci_dev *pdev;
 	struct pci_ops pci_ops;
-	struct pci_sysdata pci_sd;
+	struct pci_sysdata pci_sysdata;
 
 	struct nvmev_config config;
 	struct task_struct *nvmev_manager;
@@ -213,8 +215,9 @@ struct nvmev_dev {
 	struct nvmev_proc_info *proc_info;
 	unsigned int proc_turn;
 
-	bool msix_enabled;
 	void __iomem *msix_table;
+
+	bool intx_disabled;
 
 	struct __nvme_bar *old_bar;
 	struct nvme_ctrl_regs __iomem *bar;
