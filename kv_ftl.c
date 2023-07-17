@@ -4,7 +4,7 @@
 #include <linux/highmem.h>
 #include <linux/sched/clock.h>
 #include <linux/zstd.h>
-
+#include <linux/lz4.h>
 #include "nvmev.h"
 #include "kv_ftl.h"
 
@@ -77,7 +77,7 @@ static unsigned long long __schedule_io_units(int opcode, unsigned long lba, uns
 		latency = nvmev_vdev->config.write_time;
 		trailing = nvmev_vdev->config.write_trailing;
 		//NOTE - debug
-		NVMEV_DEBUG("delay:%ld latency:%ld trailing:%ld\n", delay, latency, trailing);
+		NVMEV_DEBUG("delay:%u latency:%u trailing:%u\n", delay, latency, trailing);
 		//COMP_DEBUG("schedule_io_units: delay:%ld latency:%ld trailing:%ld\n", delay, latency, trailing);
 	} else if (opcode == nvme_cmd_read || opcode == nvme_cmd_kv_retrieve) {
 		delay = nvmev_vdev->config.read_delay;
@@ -506,6 +506,7 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 	size_t new_offset = 0;
 	struct mapping_entry entry;
 	int is_insert = 0;
+	// char data[4097];
 
 	entry = get_mapping_entry(kv_ftl, cmd);
 	offset = entry.mem_offset;
@@ -605,12 +606,13 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 			if (io_size + mem_offs > PAGE_SIZE)
 				io_size = PAGE_SIZE - mem_offs;
 		}
+		// snprintf(data, 4096, "%s\n", (char *)vaddr + mem_offs);
+		// COMP_DEBUG("value: %s\n", data);
 		if (cmd.common.opcode == nvme_cmd_kv_store) {
-			/* TODO: implement compression */
 			COMP_DEBUG("memcpy, io_size: %ld\n", io_size);
+			//print_hex_dump(KERN_INFO, "data: ", DUMP_PREFIX_NONE, 16, 4,vaddr + mem_offs, io_size, false);
 			memcpy(nvmev_vdev->storage_mapped + offset, vaddr + mem_offs, io_size);
 		} else if (cmd.common.opcode == nvme_cmd_kv_retrieve) {
-			/* TODO: implement decompression */
 			memcpy(vaddr + mem_offs, nvmev_vdev->storage_mapped + offset, io_size);
 		} else {
 			NVMEV_ERROR("Wrong KV Command passed to NVMeVirt!!\n");
@@ -961,6 +963,50 @@ static unsigned int __do_perform_kv_iter_io(struct kv_ftl *kv_ftl, struct nvme_k
 	return 0;
 }
 
+void compress(struct nvme_command *cmd)
+{
+	/* SECTION - compress */
+	struct nvme_kv_command *kvcmd = (struct nvme_kv_command *)cmd;
+	void *vaddr, *workmem;
+	char *compressed_data;
+	u64 paddr;
+	size_t length, compressed_size;
+	size_t mem_offs = 0;
+	char data[4097];
+	int output_size;
+
+	paddr = kv_io_cmd_value_prp(*kvcmd, 1);
+	vaddr = kmap_atomic_pfn(PRP_PFN(paddr));
+	length = cmd_value_length(*kvcmd);
+	if (paddr & PAGE_OFFSET_MASK) {
+		mem_offs = paddr & PAGE_OFFSET_MASK;
+	}
+	snprintf(data, 4096, "%s\n", (char *)vaddr + mem_offs);
+	COMP_DEBUG("value from kv_proc_nvme_io_cmd: %s\n", data);
+	workmem = vmalloc(LZ4_MEM_COMPRESS);
+	if (!workmem) {
+		COMP_DEBUG("kmalloc error workmem\n");
+	}
+	output_size = LZ4_COMPRESSBOUND(length);
+	COMP_DEBUG("output size: %d\n", output_size);
+	compressed_data = (char *)vmalloc(output_size);
+	if (!compressed_data) {
+		COMP_DEBUG("kmalloc error compressed_data\n");
+	}
+
+	// compressed_size =
+	// 	LZ4_compress_default(data, compressed_data, (int)length, output_size, workmem);
+	/* TODO: move compressed data to vaddr + offset */
+	// COMP_DEBUG("compressed data: %s size: %ld\n", compressed_data, compressed_size);
+
+	vfree(compressed_data);
+	vfree(workmem);
+	/* !SECTION */
+}
+
+/* TODO implement compression 
+ * if __schedule_io_units is guaranteed to come before memcpy 
+ * also maybe include an extra parameter @cmd */
 bool kv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
 {
 	struct nvme_command *cmd = req->cmd;
@@ -976,6 +1022,13 @@ bool kv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struct 
 		ret->nsecs_target = __schedule_flush(req);
 		break;
 	case nvme_cmd_kv_store:
+		compress(cmd);
+		ret->nsecs_target = __schedule_io_units(
+			cmd->common.opcode, 0, cmd_value_length(*((struct nvme_kv_command *)cmd)),
+			__get_wallclock());
+		NVMEV_INFO("%d, %llu, %llu\n", cmd_value_length(*((struct nvme_kv_command *)cmd)),
+			   __get_wallclock(), ret->nsecs_target);
+		break;
 	case nvme_cmd_kv_retrieve:
 	case nvme_cmd_kv_batch:
 		ret->nsecs_target = __schedule_io_units(
