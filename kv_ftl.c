@@ -963,6 +963,9 @@ static unsigned int __do_perform_kv_iter_io(struct kv_ftl *kv_ftl, struct nvme_k
 	return 0;
 }
 
+/* NOTE implement compression 
+ * if __schedule_io_units is guaranteed to come before memcpy 
+ */
 void compress(struct nvme_command *cmd)
 {
 	/* SECTION - compress */
@@ -981,38 +984,40 @@ void compress(struct nvme_command *cmd)
 	if (paddr & PAGE_OFFSET_MASK) {
 		mem_offs = paddr & PAGE_OFFSET_MASK;
 	}
-	snprintf(data, 4096, "%s\n", (char *)vaddr + mem_offs);
-	COMP_DEBUG("value from kv_proc_nvme_io_cmd: %s\n", data);
+	snprintf(data, 4096, "%s", (char *)vaddr + mem_offs);
+	COMP_DEBUG("original size: %ld, original data: %s\n", length, data);
 	workmem = vmalloc(LZ4_MEM_COMPRESS);
 	if (!workmem) {
 		COMP_DEBUG("kmalloc error workmem\n");
 	}
 	output_size = LZ4_COMPRESSBOUND(length);
-	COMP_DEBUG("output size: %d\n", output_size);
+	// COMP_DEBUG("output size: %d\n", output_size);
 	compressed_data = (char *)vmalloc(output_size);
 	if (!compressed_data) {
 		COMP_DEBUG("kmalloc error compressed_data\n");
 	}
 
-	// compressed_size =
-	// 	LZ4_compress_default(data, compressed_data, (int)length, output_size, workmem);
+	compressed_size =
+		LZ4_compress_default(data, compressed_data, (int)length, output_size, workmem);
+	if (compressed_size <= length) {
+		memcpy(vaddr + mem_offs, compressed_data, compressed_size);
+	}
+	COMP_DEBUG("compressed size: %ld, compressed data: %s\n", compressed_size, compressed_data);
+	// COMP_DEBUG("size difference : %ld\n", length - compressed_size);
 	/* TODO: move compressed data to vaddr + offset */
-	// COMP_DEBUG("compressed data: %s size: %ld\n", compressed_data, compressed_size);
 
 	vfree(compressed_data);
 	vfree(workmem);
 	/* !SECTION */
 }
 
-/* TODO implement compression 
- * if __schedule_io_units is guaranteed to come before memcpy 
- * also maybe include an extra parameter @cmd */
 bool kv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
 {
 	struct nvme_command *cmd = req->cmd;
 
 	switch (cmd->common.opcode) {
 	case nvme_cmd_write:
+		// COMP_DEBUG("nvme_cmd_write\n");
 	case nvme_cmd_read:
 		ret->nsecs_target = __schedule_io_units(
 			cmd->common.opcode, cmd->rw.slba,
