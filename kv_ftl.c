@@ -57,6 +57,20 @@ static unsigned int cmd_value_length(struct nvme_kv_command cmd)
 	}
 }
 
+static unsigned int cmd_value_compressed_length(struct nvme_kv_command cmd)
+{
+	if (!cmd.kv_store.rsvd2 || !cmd.kv_retrieve.rsvd2) {
+		return cmd_value_length(cmd);
+	}
+	if (cmd.common.opcode == nvme_cmd_kv_store) {
+		return cmd.kv_store.rsvd2;
+	} else if (cmd.common.opcode == nvme_cmd_kv_retrieve) {
+		return cmd.kv_retrieve.rsvd2;
+	} else {
+		return cmd.kv_store.rsvd2;
+	}
+}
+
 /* Return the time to complete */
 static unsigned long long __schedule_io_units(int opcode, unsigned long lba, unsigned int length,
 					      unsigned long long nsecs_start)
@@ -189,7 +203,7 @@ static unsigned int find_next_slot(struct kv_ftl *kv_ftl, int original_slot, int
 }
 
 static unsigned int new_mapping_entry(struct kv_ftl *kv_ftl, struct nvme_kv_command cmd,
-				      size_t val_offset)
+				      size_t val_offset, size_t compressed_size)
 {
 	unsigned int slot = -1;
 	unsigned int prev_slot;
@@ -210,14 +224,22 @@ static unsigned int new_mapping_entry(struct kv_ftl *kv_ftl, struct nvme_kv_comm
 	memcpy(kv_ftl->kv_mapping_table[slot].key, cmd.kv_store.key, cmd.kv_store.key_len + 1);
 	kv_ftl->kv_mapping_table[slot].mem_offset = val_offset;
 	kv_ftl->kv_mapping_table[slot].length = cmd_value_length(cmd);
+	kv_ftl->kv_mapping_table[slot].compressed_size = compressed_size;
+	if (compressed_size) {
+		COMP_DEBUG("COMPRESSED: TRUE\n");
+		kv_ftl->kv_mapping_table[slot].compressed = true;
+	} else {
+		COMP_DEBUG("COMPRESSED: FALSE\n");
+		kv_ftl->kv_mapping_table[slot].compressed = false;
+	}
 	/* hash chaining */
 	if (prev_slot != -1) {
 		NVMEV_DEBUG("Linking slot %d to new slot %d", prev_slot, slot);
 		chain_mapping(kv_ftl, prev_slot, slot);
 	}
 
-	NVMEV_DEBUG("New mapping entry key %s offset %lu length %u slot %u\n", cmd.kv_store.key,
-		    val_offset, cmd_value_length(cmd), slot);
+	NVMEV_DEBUG("New mapping entry key %s offset %lu length %u compressed_size %lu slot %u\n",
+		    cmd.kv_store.key, val_offset, cmd_value_length(cmd), compressed_size, slot);
 
 	return 0;
 }
@@ -356,6 +378,8 @@ static struct mapping_entry get_mapping_entry(struct kv_ftl *kv_ftl, struct nvme
 		mapping.mem_offset = kv_ftl->kv_mapping_table[slot].mem_offset;
 		mapping.next_slot = kv_ftl->kv_mapping_table[slot].next_slot;
 		mapping.length = kv_ftl->kv_mapping_table[slot].length;
+		mapping.compressed = kv_ftl->kv_mapping_table[slot].compressed;
+		mapping.compressed_size = kv_ftl->kv_mapping_table[slot].compressed_size;
 	}
 
 	if (!found)
@@ -493,11 +517,53 @@ static struct mapping_entry delete_mapping_entry(struct kv_ftl *kv_ftl, struct n
  *   if mapping_entry exist -> read from mem_offset
  *   else -> key doesn't exist!
  */
+unsigned int try_to_compress(struct nvme_kv_command cmd)
+{
+	void *vaddr, *workmem;
+	char *compressed_data;
+	u64 paddr;
+	size_t length, compressed_size;
+	size_t mem_offs = 0;
+	char data[4097];
+	int output_size;
+
+	paddr = kv_io_cmd_value_prp(cmd, 1);
+	vaddr = kmap_atomic_pfn(PRP_PFN(paddr));
+	length = cmd_value_length(cmd);
+	if (paddr & PAGE_OFFSET_MASK) {
+		mem_offs = paddr & PAGE_OFFSET_MASK;
+	}
+	snprintf(data, 4096, "%s", (char *)vaddr + mem_offs);
+	COMP_DEBUG("original size: %ld, original data: %s\n", length, data);
+	workmem = vmalloc(LZ4_MEM_COMPRESS);
+	if (!workmem) {
+		COMP_DEBUG("vmalloc error workmem\n");
+	}
+	output_size = LZ4_COMPRESSBOUND(length);
+	// COMP_DEBUG("output size: %d\n", output_size);
+	compressed_data = (char *)vmalloc(output_size);
+	if (!compressed_data) {
+		COMP_DEBUG("vmalloc error compressed_data\n");
+	}
+	compressed_size =
+		LZ4_compress_default(data, compressed_data, (int)length, output_size, workmem);
+	if (compressed_size <= length) {
+		COMP_DEBUG("COMPRESSING DATA for key: %s\n", cmd.kv_store.key);
+		COMP_DEBUG("compressed size: %ld, compressed data: %s\n", compressed_size,
+			   compressed_data);
+		memcpy(vaddr + mem_offs, compressed_data, compressed_size);
+		COMP_DEBUG("COMPRESSING DONE\n");
+		return compressed_size;
+	} else {
+		COMP_DEBUG("DO NOT COMPRESS THIS DATA\n");
+		return 0;
+	}
+}
 static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_command cmd,
 				       unsigned int *status)
 {
 	size_t offset;
-	size_t length, remaining;
+	size_t length, remaining, compressed_size;
 	int prp_offs = 0;
 	int prp2_offs = 0;
 	u64 paddr;
@@ -506,13 +572,17 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 	size_t new_offset = 0;
 	struct mapping_entry entry;
 	int is_insert = 0;
-	// char data[4097];
+	char data[4097];
+	char *decompressed;
 
 	entry = get_mapping_entry(kv_ftl, cmd);
 	offset = entry.mem_offset;
-	length = cmd_value_length(cmd);
 
 	if (cmd.common.opcode == nvme_cmd_kv_store) {
+		if ((compressed_size = try_to_compress(cmd)))
+			length = compressed_size;
+		else
+			length = cmd_value_length(cmd);
 		if (entry.mem_offset == -1) { // entry doesn't exist -> is insert
 			new_offset = allocate_mem_offset(kv_ftl, cmd);
 			offset = new_offset;
@@ -532,6 +602,7 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 			}
 		}
 	} else if (cmd.common.opcode == nvme_cmd_kv_retrieve) {
+		length = cmd_value_length(cmd);
 		if (entry.mem_offset == -1) { // kv pair doesn't exist
 			NVMEV_DEBUG("kv_retrieve %s no exist\n", cmd.kv_store.key);
 
@@ -555,13 +626,14 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 			return 0;
 		}
 	} else if (cmd.common.opcode == nvme_cmd_kv_delete) {
+		length = cmd_value_length(cmd);
 		if (entry.mem_offset == -1) { // kv pair doesn't exist
 			NVMEV_DEBUG("kv_delete %s no exist\n", cmd.kv_store.key);
 
 			*status = KV_ERR_KEY_NOT_EXIST;
 			return 0; // dev_status_code for KVS_ERR_KEY_NOT_EXIST
 		} else {
-			NVMEV_DEBUG("kv_delete %s exist - length %ld, offset %lu\n",
+			NVMEV_DEBUG("kv_delete %s exist - compressed length %ld, offset %lu\n",
 				    cmd.kv_store.key, length, offset);
 
 			delete_mapping_entry(kv_ftl, cmd);
@@ -606,14 +678,35 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 			if (io_size + mem_offs > PAGE_SIZE)
 				io_size = PAGE_SIZE - mem_offs;
 		}
-		// snprintf(data, 4096, "%s\n", (char *)vaddr + mem_offs);
+		snprintf(data, length, "%s", (char *)vaddr + mem_offs);
 		// COMP_DEBUG("value: %s\n", data);
 		if (cmd.common.opcode == nvme_cmd_kv_store) {
+			// COMP_DEBUG("size difference : %ld\n", length - compressed_size);
 			COMP_DEBUG("memcpy, io_size: %ld\n", io_size);
 			//print_hex_dump(KERN_INFO, "data: ", DUMP_PREFIX_NONE, 16, 4,vaddr + mem_offs, io_size, false);
 			memcpy(nvmev_vdev->storage_mapped + offset, vaddr + mem_offs, io_size);
 		} else if (cmd.common.opcode == nvme_cmd_kv_retrieve) {
-			memcpy(vaddr + mem_offs, nvmev_vdev->storage_mapped + offset, io_size);
+			if (entry.compressed == true) {
+				/* decompress */
+				COMP_DEBUG("DECOMPRESSING DATA\n");
+				decompressed = (char *)vmalloc(length);
+				if (!decompressed) {
+					COMP_DEBUG("vmalloc error decompressed\n");
+				}
+				snprintf(data, entry.compressed_size, "%s",
+					 (char *)nvmev_vdev->storage_mapped + offset);
+				COMP_DEBUG("compressed data: %s\n", data);
+				LZ4_decompress_fast(nvmev_vdev->storage_mapped + offset,
+						    decompressed, length);
+				COMP_DEBUG("DECOMPRESS DONE\n");
+				COMP_DEBUG("decompressed data: %s\n", decompressed);
+				memcpy(vaddr + mem_offs, decompressed, length);
+				vfree(decompressed);
+			} else {
+				COMP_DEBUG("NOT COMPRESSED DATA\n");
+				memcpy(vaddr + mem_offs, nvmev_vdev->storage_mapped + offset,
+				       io_size);
+			}
 		} else {
 			NVMEV_ERROR("Wrong KV Command passed to NVMeVirt!!\n");
 		}
@@ -628,7 +721,7 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 		kunmap_atomic(paddr_list);
 
 	if (is_insert == 1) { // need to make new mapping
-		new_mapping_entry(kv_ftl, cmd, new_offset);
+		new_mapping_entry(kv_ftl, cmd, new_offset, compressed_size);
 	} else if (is_insert == 2) {
 		update_mapping_entry(kv_ftl, cmd);
 	}
@@ -966,13 +1059,12 @@ static unsigned int __do_perform_kv_iter_io(struct kv_ftl *kv_ftl, struct nvme_k
 /* NOTE implement compression 
  * if __schedule_io_units is guaranteed to come before memcpy 
  */
-void compress(struct nvme_command *cmd)
+static unsigned long long get_compress_time(struct nvme_command *cmd)
 {
-	/* SECTION - compress */
 	struct nvme_kv_command *kvcmd = (struct nvme_kv_command *)cmd;
 	void *vaddr, *workmem;
 	char *compressed_data;
-	u64 paddr;
+	u64 paddr, time0, time1;
 	size_t length, compressed_size;
 	size_t mem_offs = 0;
 	char data[4097];
@@ -985,29 +1077,80 @@ void compress(struct nvme_command *cmd)
 		mem_offs = paddr & PAGE_OFFSET_MASK;
 	}
 	snprintf(data, 4096, "%s", (char *)vaddr + mem_offs);
-	COMP_DEBUG("original size: %ld, original data: %s\n", length, data);
+	// COMP_DEBUG("original size: %ld, original data: %s\n", length, data);
 	workmem = vmalloc(LZ4_MEM_COMPRESS);
 	if (!workmem) {
-		COMP_DEBUG("kmalloc error workmem\n");
+		COMP_DEBUG("vmalloc error workmem\n");
 	}
 	output_size = LZ4_COMPRESSBOUND(length);
 	// COMP_DEBUG("output size: %d\n", output_size);
 	compressed_data = (char *)vmalloc(output_size);
 	if (!compressed_data) {
-		COMP_DEBUG("kmalloc error compressed_data\n");
+		COMP_DEBUG("vmalloc error compressed_data\n");
 	}
-
+	time0 = ktime_get_ns();
 	compressed_size =
 		LZ4_compress_default(data, compressed_data, (int)length, output_size, workmem);
-	if (compressed_size <= length) {
-		memcpy(vaddr + mem_offs, compressed_data, compressed_size);
-	}
-	COMP_DEBUG("compressed size: %ld, compressed data: %s\n", compressed_size, compressed_data);
-	// COMP_DEBUG("size difference : %ld\n", length - compressed_size);
-	/* TODO: move compressed data to vaddr + offset */
-
+	time1 = ktime_get_ns();
+	COMP_DEBUG("compressing took %llu\n", time1 - time0);
 	vfree(compressed_data);
 	vfree(workmem);
+	return (time1 - time0);
+}
+
+/* NOTE implement decompression 
+ * if __schedule_io_units is guaranteed to come before memcpy 
+ */
+void decompress(struct nvme_command *cmd)
+{
+	/* SECTION - compress */
+	struct nvme_kv_command *kvcmd = (struct nvme_kv_command *)cmd;
+	void *vaddr, *workmem;
+	char *compressed_data;
+	u64 paddr;
+	size_t length, compressed_size;
+	size_t mem_offs = 0;
+	char data[4097];
+	int output_size;
+
+	/* if compressed, then decompress */
+	if (kvcmd->common.flags) {
+		paddr = kv_io_cmd_value_prp(*kvcmd, 1);
+		vaddr = kmap_atomic_pfn(PRP_PFN(paddr));
+		length = cmd_value_length(*kvcmd);
+		if (paddr & PAGE_OFFSET_MASK) {
+			mem_offs = paddr & PAGE_OFFSET_MASK;
+		}
+		snprintf(data, 4096, "%s", (char *)vaddr + mem_offs);
+		COMP_DEBUG("original size: %ld, original data: %s\n", length, data);
+		workmem = vmalloc(LZ4_MEM_COMPRESS);
+		if (!workmem) {
+			COMP_DEBUG("kmalloc error workmem\n");
+		}
+		output_size = LZ4_COMPRESSBOUND(length);
+		// COMP_DEBUG("output size: %d\n", output_size);
+		compressed_data = (char *)vmalloc(output_size);
+		if (!compressed_data) {
+			COMP_DEBUG("kmalloc error compressed_data\n");
+		}
+
+		compressed_size = LZ4_compress_default(data, compressed_data, (int)length,
+						       output_size, workmem);
+		if (compressed_size <= length) {
+			/* use nvme_kv_command->common->flags to indicate compression */
+			kvcmd->common.flags = 1;
+			kvcmd->kv_store.rsvd2 = (u32)compressed_size;
+			COMP_DEBUG("compressed size: %ld, compressed data: %s\n", compressed_size,
+				   compressed_data);
+			memcpy(vaddr + mem_offs, compressed_data, compressed_size);
+		}
+		// COMP_DEBUG("size difference : %ld\n", length - compressed_size);
+		/* TODO: move compressed data to vaddr + offset */
+
+		vfree(compressed_data);
+		vfree(workmem);
+	}
+
 	/* !SECTION */
 }
 
@@ -1017,7 +1160,6 @@ bool kv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struct 
 
 	switch (cmd->common.opcode) {
 	case nvme_cmd_write:
-		// COMP_DEBUG("nvme_cmd_write\n");
 	case nvme_cmd_read:
 		ret->nsecs_target = __schedule_io_units(
 			cmd->common.opcode, cmd->rw.slba,
@@ -1027,7 +1169,7 @@ bool kv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struct 
 		ret->nsecs_target = __schedule_flush(req);
 		break;
 	case nvme_cmd_kv_store:
-		compress(cmd);
+		ret->nsecs_target += get_compress_time(cmd);
 		ret->nsecs_target = __schedule_io_units(
 			cmd->common.opcode, 0, cmd_value_length(*((struct nvme_kv_command *)cmd)),
 			__get_wallclock());
@@ -1035,6 +1177,12 @@ bool kv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struct 
 			   __get_wallclock(), ret->nsecs_target);
 		break;
 	case nvme_cmd_kv_retrieve:
+		ret->nsecs_target = __schedule_io_units(
+			cmd->common.opcode, 0, cmd_value_length(*((struct nvme_kv_command *)cmd)),
+			__get_wallclock());
+		NVMEV_INFO("%d, %llu, %llu\n", cmd_value_length(*((struct nvme_kv_command *)cmd)),
+			   __get_wallclock(), ret->nsecs_target);
+		break;
 	case nvme_cmd_kv_batch:
 		ret->nsecs_target = __schedule_io_units(
 			cmd->common.opcode, 0, cmd_value_length(*((struct nvme_kv_command *)cmd)),
