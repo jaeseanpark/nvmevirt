@@ -21,7 +21,7 @@ static void __init_apicid_to_cpuid(void)
 	}
 }
 
-static void __signal_irq(unsigned int irq)
+static void __signal_irq(const char *type, unsigned int irq)
 {
 	struct irq_data *irqd = irq_get_irq_data(irq);
 	struct irq_cfg *irqc = irqd_cfg(irqd);
@@ -29,17 +29,18 @@ static void __signal_irq(unsigned int irq)
 	unsigned int target = irqc->dest_apicid;
 	unsigned int target_cpu = apicid_to_cpuid[target];
 
-	NVMEV_DEBUG("vector %d, dest_apicid %d, target_cpu %d\n", irqc->vector, target, target_cpu);
+	NVMEV_DEBUG_VERBOSE("irq: %s %d, vector %d, apic %d, cpu %d\n", type, irq, irqc->vector, target, target_cpu);
 	apic->send_IPI(target_cpu, irqc->vector);
 
 	return;
 }
 #else
-static void __signal_irq(unsigned int irq)
+static void __signal_irq(const char *type, unsigned int irq)
 {
 	struct irq_data *data = irq_get_irq_data(irq);
 	struct irq_chip *chip = irq_data_get_irq_chip(data);
 
+	NVMEV_DEBUG_VERBOSE("irq: %s %d, vector %d\n", type, irq, irqd_cfg(data)->vector);
 	BUG_ON(!chip->irq_retrigger);
 	chip->irq_retrigger(data);
 
@@ -53,7 +54,7 @@ static void __process_msi_irq(int msi_index)
 	unsigned int virq = msi_get_virq(&nvmev_vdev->pdev->dev, msi_index);
 
 	BUG_ON(virq == 0);
-	__signal_irq(virq);
+	__signal_irq("msi", virq);
 }
 #else
 static void __process_msi_irq(int msi_index)
@@ -62,7 +63,7 @@ static void __process_msi_irq(int msi_index)
 
 	for_each_msi_entry_safe(msi_desc, tmp, (&nvmev_vdev->pdev->dev)) {
 		if (msi_desc->msi_attrib.entry_nr == msi_index) {
-			__signal_irq(msi_desc->irq);
+			__signal_irq("msi", msi_desc->irq);
 			return;
 		}
 	}
@@ -78,7 +79,7 @@ void nvmev_signal_irq(int msi_index)
 	} else {
 		nvmev_vdev->pcihdr->sts.is = 1;
 
-		__signal_irq(nvmev_vdev->pdev->irq);
+		__signal_irq("int", nvmev_vdev->pdev->irq);
 	}
 }
 
@@ -134,7 +135,7 @@ void nvmev_proc_bars(void)
 #endif
 	if (old_bar->aqa != bar->u_aqa) {
 		// Initalize admin queue
-		NVMEV_DEBUG("AQA: 0x%x -> 0x%x\n", old_bar->aqa, bar->u_aqa);
+		NVMEV_DEBUG("%s: aqa 0x%x -> 0x%x\n", __func__, old_bar->aqa, bar->u_aqa);
 		old_bar->aqa = bar->u_aqa;
 
 		if (!queue) {
@@ -169,7 +170,7 @@ void nvmev_proc_bars(void)
 			goto out;
 		}
 
-		NVMEV_DEBUG("ASQ: 0x%llx -> 0x%llx\n", old_bar->asq, bar->u_asq);
+		NVMEV_DEBUG("%s: asq 0x%llx -> 0x%llx\n", __func__, old_bar->asq, bar->u_asq);
 		old_bar->asq = bar->u_asq;
 
 		if (queue->nvme_sq) {
@@ -199,7 +200,7 @@ void nvmev_proc_bars(void)
 			goto out;
 		}
 
-		NVMEV_DEBUG("ACQ: 0x%llx -> 0x%llx\n", old_bar->acq, bar->u_acq);
+		NVMEV_DEBUG("%s: acq 0x%llx -> 0x%llx\n", __func__, old_bar->acq, bar->u_acq);
 		old_bar->acq = bar->u_acq;
 
 		if (queue->nvme_cq) {
@@ -225,7 +226,7 @@ void nvmev_proc_bars(void)
 		goto out;
 	}
 	if (old_bar->cc != bar->u_cc) {
-		NVMEV_DEBUG("CC: 0x%x:%x -> 0x%x:%x\n", old_bar->cc, old_bar->csts, bar->u_cc,
+		NVMEV_DEBUG("%s: cc 0x%x:%x -> 0x%x:%x\n", __func__, old_bar->cc, old_bar->csts, bar->u_cc,
 			    bar->u_csts);
 		/* Enable */
 		if (bar->cc.en == 1) {
@@ -263,7 +264,7 @@ int nvmev_pci_read(struct pci_bus *bus, unsigned int devfn, int where, int size,
 
 	memcpy(val, nvmev_vdev->virtDev + where, size);
 
-	NVMEV_DEBUG("[R] target: %x, size: %d, val: %x\n", where, size, *val);
+	NVMEV_DEBUG_VERBOSE("[R] 0x%x, size: %d, val: 0x%x\n", where, size, *val);
 
 	return 0;
 };
@@ -314,10 +315,12 @@ int nvmev_pci_write(struct pci_bus *bus, unsigned int devfn, int where, int size
 		} else {
 			mask = 0x0;
 		}
-	} else {
+	} else if (where < OFFS_PCI_EXT_CAP) {
 		// PCIE_CAP
+	} else {
+		// PCI_EXT_CAP
 	}
-	NVMEV_DEBUG("[W] 0x%x, mask: 0x%x, val: 0x%x -> 0x%x, size: %d, new: 0x%x\n", where, mask,
+	NVMEV_DEBUG_VERBOSE("[W] 0x%x, mask: 0x%x, val: 0x%x -> 0x%x, size: %d, new: 0x%x\n", where, mask,
 		    val, _val, size, (val & (~mask)) | (_val & mask));
 
 	val = (val & (~mask)) | (_val & mask);
@@ -326,8 +329,20 @@ int nvmev_pci_write(struct pci_bus *bus, unsigned int devfn, int where, int size
 	return 0;
 };
 
+static struct pci_ops nvmev_pci_ops = {
+	.read = nvmev_pci_read,
+	.write = nvmev_pci_write,
+};
+
+static struct pci_sysdata nvmev_pci_sysdata = {
+	.domain = NVMEV_PCI_DOMAIN_NUM,
+	.node = 0,
+};
+
+
 static void __dump_pci_dev(struct pci_dev *dev)
 {
+	/*
 	NVMEV_DEBUG("bus: %p, subordinate: %p\n", dev->bus, dev->subordinate);
 	NVMEV_DEBUG("vendor: %x, device: %x\n", dev->vendor, dev->device);
 	NVMEV_DEBUG("s_vendor: %x, s_device: %x\n", dev->subsystem_vendor, dev->subsystem_device);
@@ -336,6 +351,33 @@ static void __dump_pci_dev(struct pci_dev *dev)
 	NVMEV_DEBUG("pin: %d, irq: %u\n", dev->pin, dev->irq);
 	NVMEV_DEBUG("msi: %d, msi-x:%d\n", dev->msi_enabled, dev->msix_enabled);
 	NVMEV_DEBUG("resource[0]: %llx\n", pci_resource_start(dev, 0));
+	*/
+}
+
+static void __init_nvme_ctrl_regs(struct pci_dev *dev)
+{
+	struct nvme_ctrl_regs *bar = memremap(pci_resource_start(dev, 0), PAGE_SIZE * 2, MEMREMAP_WT);
+	BUG_ON(!bar);
+
+	nvmev_vdev->bar = bar;
+	memset(bar, 0x0, PAGE_SIZE * 2);
+
+	nvmev_vdev->dbs = ((void *)bar) + PAGE_SIZE;
+
+	*bar = (struct nvme_ctrl_regs) {
+		.cap = {
+			.to = 1,
+			.mpsmin = 0,
+			.mqes = 1024 - 1, // 0-based value
+#if (SUPPORTED_SSD_TYPE(ZNS))
+			.css = CAP_CSS_BIT_SPECIFIC,
+#endif
+		},
+		.vs = {
+			.mjr = 1,
+			.mnr = 0,
+		},
+	};
 }
 
 static struct pci_bus *__create_pci_bus(void)
@@ -343,17 +385,9 @@ static struct pci_bus *__create_pci_bus(void)
 	struct pci_bus *bus = NULL;
 	struct pci_dev *dev;
 
-	nvmev_vdev->pci_ops = (struct pci_ops){
-		.read = nvmev_pci_read,
-		.write = nvmev_pci_write,
-	};
+	nvmev_pci_sysdata.node = cpu_to_node(nvmev_vdev->config.cpu_nr_dispatcher);
 
-	nvmev_vdev->pci_sysdata = (struct pci_sysdata){
-		.domain = NVMEV_PCI_DOMAIN_NUM,
-		.node = cpu_to_node(nvmev_vdev->config.cpu_nr_dispatcher),
-	};
-
-	bus = pci_scan_bus(NVMEV_PCI_BUS_NUM, &nvmev_vdev->pci_ops, &nvmev_vdev->pci_sysdata);
+	bus = pci_scan_bus(NVMEV_PCI_BUS_NUM, &nvmev_pci_ops, &nvmev_pci_sysdata);
 
 	if (!bus) {
 		NVMEV_ERROR("Unable to create PCI bus\n");
@@ -366,23 +400,10 @@ static struct pci_bus *__create_pci_bus(void)
 		res->parent = &iomem_resource;
 
 		nvmev_vdev->pdev = dev;
-		dev->irq = NVMEV_INTX_IRQ;
-
+		dev->irq = nvmev_vdev->pcihdr->intr.iline;
 		__dump_pci_dev(dev);
 
-		nvmev_vdev->bar = memremap(pci_resource_start(dev, 0), PAGE_SIZE * 2, MEMREMAP_WT);
-		memset(nvmev_vdev->bar, 0x0, PAGE_SIZE * 2);
-
-		nvmev_vdev->dbs = ((void *)nvmev_vdev->bar) + PAGE_SIZE;
-
-		nvmev_vdev->bar->vs.mjr = 1;
-		nvmev_vdev->bar->vs.mnr = 0;
-		nvmev_vdev->bar->cap.mpsmin = 0;
-		nvmev_vdev->bar->cap.mqes = 1024 - 1; // 0-based value
-
-#if (SUPPORTED_SSD_TYPE(ZNS))
-		nvmev_vdev->bar->cap.css = CAP_CSS_BIT_SPECIFIC;
-#endif
+		__init_nvme_ctrl_regs(dev);
 
 		nvmev_vdev->old_dbs = kzalloc(PAGE_SIZE, GFP_KERNEL);
 		BUG_ON(!nvmev_vdev->old_dbs && "allocating old DBs memory");
@@ -398,8 +419,7 @@ static struct pci_bus *__create_pci_bus(void)
 		memset(nvmev_vdev->msix_table, 0x00, NR_MAX_IO_QUEUE * PCI_MSIX_ENTRY_SIZE);
 	}
 
-	NVMEV_INFO("Successfully created virtual PCI bus (node %d)\n",
-		   nvmev_vdev->pci_sysdata.node);
+	NVMEV_INFO("Virtual PCI bus created (node %d)\n", nvmev_pci_sysdata.node);
 
 	return bus;
 };
@@ -415,8 +435,7 @@ struct nvmev_dev *VDEV_INIT(void)
 	nvmev_vdev->pmcap = nvmev_vdev->virtDev + OFFS_PCI_PM_CAP;
 	nvmev_vdev->msixcap = nvmev_vdev->virtDev + OFFS_PCI_MSIX_CAP;
 	nvmev_vdev->pciecap = nvmev_vdev->virtDev + OFFS_PCIE_CAP;
-	nvmev_vdev->aercap = nvmev_vdev->virtDev + PCI_CFG_SPACE_SIZE;
-	nvmev_vdev->pcie_exp_cap = nvmev_vdev->virtDev + PCI_CFG_SPACE_SIZE;
+	nvmev_vdev->extcap = nvmev_vdev->virtDev + OFFS_PCI_EXT_CAP;
 
 	nvmev_vdev->admin_q = NULL;
 
@@ -454,10 +473,10 @@ void VDEV_FINALIZE(struct nvmev_dev *nvmev_vdev)
 		kfree(nvmev_vdev);
 }
 
-void PCI_HEADER_SETTINGS(struct pci_header *pcihdr, unsigned long base_pa)
+static void PCI_HEADER_SETTINGS(struct pci_header *pcihdr, unsigned long base_pa)
 {
-	pcihdr->id.did = 0x0101;
-	pcihdr->id.vid = 0x0c51;
+	pcihdr->id.did = NVMEV_DEVICE_ID;
+	pcihdr->id.vid = NVMEV_VENDOR_ID;
 	/*
 	pcihdr->cmd.id = 1;
 	pcihdr->cmd.bme = 1;
@@ -479,8 +498,8 @@ void PCI_HEADER_SETTINGS(struct pci_header *pcihdr, unsigned long base_pa)
 
 	pcihdr->mulbar = base_pa >> 32;
 
-	pcihdr->ss.ssid = 0x370d;
-	pcihdr->ss.ssvid = 0x0c51;
+	pcihdr->ss.ssid = NVMEV_SUBSYSTEM_ID;
+	pcihdr->ss.ssvid = NVMEV_SUBSYSTEM_VENDOR_ID;
 
 	pcihdr->erom = 0x0;
 
@@ -490,7 +509,7 @@ void PCI_HEADER_SETTINGS(struct pci_header *pcihdr, unsigned long base_pa)
 	pcihdr->intr.iline = NVMEV_INTX_IRQ;
 }
 
-void PCI_PMCAP_SETTINGS(struct pci_pm_cap *pmcap)
+static void PCI_PMCAP_SETTINGS(struct pci_pm_cap *pmcap)
 {
 	pmcap->pid.cid = PCI_CAP_ID_PM;
 	pmcap->pid.next = OFFS_PCI_MSIX_CAP;
@@ -500,7 +519,7 @@ void PCI_PMCAP_SETTINGS(struct pci_pm_cap *pmcap)
 	pmcap->pmcs.ps = PCI_PM_CAP_PME_D0 >> 16;
 }
 
-void PCI_MSIXCAP_SETTINGS(struct pci_msix_cap *msixcap)
+static void PCI_MSIXCAP_SETTINGS(struct pci_msix_cap *msixcap)
 {
 	msixcap->mxid.cid = PCI_CAP_ID_MSIX;
 	msixcap->mxid.next = OFFS_PCIE_CAP;
@@ -515,7 +534,7 @@ void PCI_MSIXCAP_SETTINGS(struct pci_msix_cap *msixcap)
 	msixcap->mpba.pbir = 0;
 }
 
-void PCI_PCIECAP_SETTINGS(struct pcie_cap *pciecap)
+static void PCI_PCIECAP_SETTINGS(struct pcie_cap *pciecap)
 {
 	pciecap->pxid.cid = PCI_CAP_ID_EXP;
 	pciecap->pxid.next = 0x0;
@@ -535,41 +554,57 @@ void PCI_PCIECAP_SETTINGS(struct pcie_cap *pciecap)
 	pciecap->pxdcap.flrc = 1;
 }
 
-void PCI_AERCAP_SETTINGS(struct aer_cap *aercap)
+static void PCI_EXTCAP_SETTINGS(struct pci_ext_cap *ext_cap)
 {
-	aercap->aerid.cid = PCI_EXT_CAP_ID_ERR;
-	aercap->aerid.cver = 1;
-	aercap->aerid.next = PCI_CFG_SPACE_SIZE + 0x50;
-}
+	off_t offset = 0;
+	void *ext_cap_base = ext_cap;
 
-void PCI_PCIE_EXTCAP_SETTINGS(struct pci_exp_hdr *exp_cap)
-{
-	struct pci_exp_hdr *pcie_exp_cap;
+	/* AER */
+	ext_cap->cid = PCI_EXT_CAP_ID_ERR;
+	ext_cap->cver = 1;
+	ext_cap->next = PCI_CFG_SPACE_SIZE + 0x50;
 
-	pcie_exp_cap = exp_cap + 0x50;
-	pcie_exp_cap->id.cid = PCI_EXT_CAP_ID_VC;
-	pcie_exp_cap->id.cver = 1;
-	pcie_exp_cap->id.next = PCI_CFG_SPACE_SIZE + 0x80;
+	ext_cap = ext_cap_base + 0x50;
+	ext_cap->cid = PCI_EXT_CAP_ID_VC;
+	ext_cap->cver = 1;
+	ext_cap->next = PCI_CFG_SPACE_SIZE + 0x80;
 
-	pcie_exp_cap = exp_cap + 0x80;
-	pcie_exp_cap->id.cid = PCI_EXT_CAP_ID_PWR;
-	pcie_exp_cap->id.cver = 1;
-	pcie_exp_cap->id.next = PCI_CFG_SPACE_SIZE + 0x90;
+	ext_cap = ext_cap_base + 0x80;
+	ext_cap->cid = PCI_EXT_CAP_ID_PWR;
+	ext_cap->cver = 1;
+	ext_cap->next = PCI_CFG_SPACE_SIZE + 0x90;
 
-	pcie_exp_cap = exp_cap + 0x90;
-	pcie_exp_cap->id.cid = PCI_EXT_CAP_ID_ARI;
-	pcie_exp_cap->id.cver = 1;
-	pcie_exp_cap->id.next = PCI_CFG_SPACE_SIZE + 0x170;
+	ext_cap = ext_cap_base + 0x90;
+	ext_cap->cid = PCI_EXT_CAP_ID_ARI;
+	ext_cap->cver = 1;
+	ext_cap->next = PCI_CFG_SPACE_SIZE + 0x170;
 
-	pcie_exp_cap = exp_cap + 0x170;
-	pcie_exp_cap->id.cid = PCI_EXT_CAP_ID_DSN;
-	pcie_exp_cap->id.cver = 1;
-	pcie_exp_cap->id.next = PCI_CFG_SPACE_SIZE + 0x1a0;
+	ext_cap = ext_cap_base + 0x170;
+	ext_cap->cid = PCI_EXT_CAP_ID_DSN;
+	ext_cap->cver = 1;
+	ext_cap->next = PCI_CFG_SPACE_SIZE + 0x1a0;
 
-	pcie_exp_cap = exp_cap + 0x1a0;
-	pcie_exp_cap->id.cid = PCI_EXT_CAP_ID_SECPCI;
-	pcie_exp_cap->id.cver = 1;
-	pcie_exp_cap->id.next = 0;
+	ext_cap = ext_cap_base + 0x1a0;
+	ext_cap->cid = PCI_EXT_CAP_ID_SECPCI;
+	ext_cap->cver = 1;
+	ext_cap->next = 0; 
+
+	/*
+	*(ext_cap + 1) = (struct pci_ext_cap) {
+		.id = {
+			.cid = 0xdead,
+			.cver = 0xc,
+			.next = 0xafe,
+		},
+	};
+
+	PCI_CFG_SPACE_SIZE + ...;
+
+	ext_cap = ext_cap + ...;
+	ext_cap->id.cid = PCI_EXT_CAP_ID_DVSEC;
+	ext_cap->id.cver = 1;
+	ext_cap->id.next = 0;
+	*/
 }
 
 bool NVMEV_PCI_INIT(struct nvmev_dev *nvmev_vdev)
@@ -578,8 +613,7 @@ bool NVMEV_PCI_INIT(struct nvmev_dev *nvmev_vdev)
 	PCI_PMCAP_SETTINGS(nvmev_vdev->pmcap);
 	PCI_MSIXCAP_SETTINGS(nvmev_vdev->msixcap);
 	PCI_PCIECAP_SETTINGS(nvmev_vdev->pciecap);
-	PCI_AERCAP_SETTINGS(nvmev_vdev->aercap);
-	PCI_PCIE_EXTCAP_SETTINGS(nvmev_vdev->pcie_exp_cap);
+	PCI_EXTCAP_SETTINGS(nvmev_vdev->extcap);
 
 #ifdef CONFIG_NVMEV_FAST_X86_IRQ_HANDLING
 	__init_apicid_to_cpuid();
