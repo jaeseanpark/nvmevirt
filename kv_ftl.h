@@ -162,6 +162,7 @@ struct mapping_entry {
 	char key[18]; // Currently supporting keys smaller than 18 bytes
 	size_t mem_offset;
 	size_t length;
+	bool compressed;
 	unsigned int next_slot;
 };
 
