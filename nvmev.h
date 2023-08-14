@@ -39,13 +39,13 @@
 #endif
 #else
 #define NVMEV_DEBUG(string, args...)
+#define NVMEV_DEBUG_VERBOSE(string, args...)
 #endif
 
 #ifdef CONFIG_NVMEV_COMP_DEBUG
 #define COMP_DEBUG(string, args...) printk(KERN_INFO "%s: " string, COMP, ##args)
 #else
 #define COMP_DEBUG(string, args...)
-#define NVMEV_DEBUG_VERBOSE(string, args...)
 #endif
 
 #define NR_MAX_IO_QUEUE 72
