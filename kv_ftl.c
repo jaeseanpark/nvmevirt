@@ -1124,19 +1124,59 @@ static unsigned long long get_compress_time(struct nvme_command *cmd)
 	struct nvme_kv_command *kvcmd = (struct nvme_kv_command *)cmd;
 	void *vaddr, *workmem;
 	char *compressed_data;
+	int prp_offs = 0;
+	int prp2_offs = 0;
 	u64 paddr, time0, time1;
-	size_t length, compressed_size;
+	u64 *paddr_list = NULL;
+	size_t length, compressed_size, remaining;
 	size_t mem_offs = 0;
-	char data[4097];
+	size_t offset = 0;
+	char *data;
 	int output_size;
 
-	paddr = kv_io_cmd_value_prp(*kvcmd, 1);
-	vaddr = kmap_atomic_pfn(PRP_PFN(paddr));
 	length = cmd_value_length(*kvcmd);
 	if (paddr & PAGE_OFFSET_MASK) {
 		mem_offs = paddr & PAGE_OFFSET_MASK;
 	}
-	snprintf(data, 4096, "%s", (char *)vaddr + mem_offs);
+	data = vzalloc(length);
+	if (!data) {
+		COMP_DEBUG("vzalloc error data\n");
+	}
+
+	remaining = length;
+	while (remaining) {
+		size_t io_size;
+		mem_offs = 0;
+		prp_offs++;
+		if (prp_offs == 1) {
+			paddr = kv_io_cmd_value_prp(*kvcmd, 1);
+		} else if (prp_offs == 2) {
+			paddr = kv_io_cmd_value_prp(*kvcmd, 2);
+			if (remaining > PAGE_SIZE) {
+				paddr_list = kmap_atomic_pfn(PRP_PFN(paddr)) +
+					     (paddr & PAGE_OFFSET_MASK);
+				paddr = paddr_list[prp2_offs++];
+			}
+		} else {
+			paddr = paddr_list[prp2_offs++];
+		}
+
+		vaddr = kmap_atomic_pfn(PRP_PFN(paddr));
+
+		io_size = min_t(size_t, remaining, PAGE_SIZE);
+
+		if (paddr & PAGE_OFFSET_MASK) { // 일반 block io면 언제 여기에 해당?
+			mem_offs = paddr & PAGE_OFFSET_MASK;
+			if (io_size + mem_offs > PAGE_SIZE)
+				io_size = PAGE_SIZE - mem_offs;
+		}
+		memcpy(data + offset, vaddr + mem_offs, io_size);
+		// COMP_DEBUG("[%s] memoffset: %ld, vaddr: %p\n", __func__, mem_offs, vaddr);
+		// COMP_DEBUG("remaining: %ld, mem_offs: %ld, io_size: %ld\n", remaining, mem_offs,
+		// 	   io_size);
+		remaining -= io_size;
+		offset += io_size;
+	}
 	// COMP_DEBUG("original size: %ld, original data: %s\n", length, data);
 	workmem = vmalloc(LZ4_MEM_COMPRESS);
 	if (!workmem) {
@@ -1155,6 +1195,7 @@ static unsigned long long get_compress_time(struct nvme_command *cmd)
 	// COMP_DEBUG("compressing took %llu\n", time1 - time0);
 	vfree(compressed_data);
 	vfree(workmem);
+	vfree(data);
 	return (time1 - time0);
 }
 
