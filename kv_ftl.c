@@ -535,6 +535,7 @@ unsigned int try_to_compress(struct nvme_kv_command cmd)
 	length = cmd_value_length(cmd);
 
 	data = vzalloc(length);
+	COMP_DEBUG("data: %p\n", data);
 	if (!data) {
 		COMP_DEBUG("vmalloc error data\n");
 	}
@@ -567,6 +568,7 @@ unsigned int try_to_compress(struct nvme_kv_command cmd)
 				io_size = PAGE_SIZE - mem_offs;
 		}
 		memcpy(data + offset, vaddr + mem_offs, io_size);
+		COMP_DEBUG("data(2): %p\n", data);
 		// COMP_DEBUG("[%s] memoffset: %ld, vaddr: %p\n", __func__, mem_offs, vaddr);
 		// COMP_DEBUG("remaining: %ld, mem_offs: %ld, io_size: %ld\n", remaining, mem_offs,
 		// 	   io_size);
@@ -585,29 +587,46 @@ unsigned int try_to_compress(struct nvme_kv_command cmd)
 	}
 
 	output_size = LZ4_COMPRESSBOUND(length);
-	// COMP_DEBUG("output size: %d\n", output_size);
-	compressed_data = (char *)vmalloc(output_size);
+	COMP_DEBUG("output size: %d\n", output_size);
+	compressed_data = (char *)vzalloc(output_size);
+	COMP_DEBUG("compressed_data: %p\n", compressed_data);
 	if (!compressed_data) {
 		COMP_DEBUG("vmalloc error compressed_data\n");
 	}
 
 	compressed_size =
 		LZ4_compress_default(data, compressed_data, (int)length, output_size, workmem);
-	vfree(workmem);
+	COMP_DEBUG("data(3): %p\n", data);
+	COMP_DEBUG("compressed_data(2): %p\n", compressed_data);
 
-	if (compressed_size <= length) {
-		COMP_DEBUG("COMPRESSING DATA for key: %s\n", cmd.kv_store.key);
-		COMP_DEBUG("compressed size: %ld, compressed data: %s\n", compressed_size,
-			   compressed_data);
-		memcpy(vaddr + mem_offs, compressed_data, compressed_size);
-		COMP_DEBUG("COMPRESSING DONE\n");
-		vfree(compressed_data);
-		vfree(data);
+	if (compressed_size) {
+		if (compressed_size <= length) {
+			COMP_DEBUG("COMPRESSING DATA for key: %s\n", cmd.kv_store.key);
+			COMP_DEBUG("compressed size: %ld, compressed data: %s\n", compressed_size,
+				   compressed_data);
+			printk("\n");
+			for (i = 0; i < compressed_size; i++) {
+				printk(KERN_CONT "%c", *(compressed_data + i));
+			}
+			printk("\n");
+			memcpy(vaddr + mem_offs, compressed_data, compressed_size);
+			COMP_DEBUG("compressed_data(3): %p\n", compressed_data);
+			COMP_DEBUG("COMPRESSING DONE\n");
+		} else {
+			COMP_DEBUG("DO NOT COMPRESS THIS DATA! size: %ld\n", compressed_size);
+		}
+	} else {
+		COMP_DEBUG("COMPRESSION FAIL\n");
+	}
+	vfree(workmem);
+	vfree(data);
+	vfree(compressed_data);
+	workmem = NULL;
+	data = NULL;
+	compressed_data = NULL;
+	if (compressed_size) {
 		return compressed_size;
 	} else {
-		COMP_DEBUG("DO NOT COMPRESS THIS DATA! size: %ld\n", compressed_size);
-		vfree(compressed_data);
-		vfree(data);
 		return 0;
 	}
 }
@@ -736,7 +755,7 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 		if (cmd.common.opcode == nvme_cmd_kv_store) {
 			// snprintf(data, length, "%s", (char *)vaddr + mem_offs);
 			// COMP_DEBUG("size difference : %ld\n", length - compressed_size);
-			//COMP_DEBUG("memcpy, io_size: %ld\n", io_size);
+			COMP_DEBUG("memcpy, io_size: %ld\n", io_size);
 			//print_hex_dump(KERN_INFO, "data: ", DUMP_PREFIX_NONE, 16, 4,vaddr + mem_offs, io_size, false);
 			memcpy(nvmev_vdev->storage_mapped + offset, vaddr + mem_offs, io_size);
 			remaining -= io_size;
@@ -763,6 +782,7 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 				remaining -= length;
 				offset += length;
 				vfree(decompressed);
+				decompressed = NULL;
 			} else {
 				COMP_DEBUG("NOT COMPRESSED DATA\n");
 				memcpy(vaddr + mem_offs, nvmev_vdev->storage_mapped + offset,
@@ -789,6 +809,7 @@ static unsigned int __do_perform_kv_io(struct kv_ftl *kv_ftl, struct nvme_kv_com
 	if (cmd.common.opcode == nvme_cmd_kv_retrieve)
 		return length;
 
+	COMP_DEBUG("%s done\n", __func__);
 	return 0;
 }
 
@@ -1121,6 +1142,7 @@ static unsigned int __do_perform_kv_iter_io(struct kv_ftl *kv_ftl, struct nvme_k
  */
 static unsigned long long get_compress_time(struct nvme_command *cmd)
 {
+	COMP_DEBUG("%s start\n", __func__);
 	struct nvme_kv_command *kvcmd = (struct nvme_kv_command *)cmd;
 	void *vaddr, *workmem;
 	char *compressed_data;
@@ -1135,9 +1157,6 @@ static unsigned long long get_compress_time(struct nvme_command *cmd)
 	int output_size;
 
 	length = cmd_value_length(*kvcmd);
-	if (paddr & PAGE_OFFSET_MASK) {
-		mem_offs = paddr & PAGE_OFFSET_MASK;
-	}
 	data = vzalloc(length);
 	if (!data) {
 		COMP_DEBUG("vzalloc error data\n");
@@ -1196,6 +1215,10 @@ static unsigned long long get_compress_time(struct nvme_command *cmd)
 	vfree(compressed_data);
 	vfree(workmem);
 	vfree(data);
+	workmem = NULL;
+	data = NULL;
+	compressed_data = NULL;
+	COMP_DEBUG("%s done\n", __func__);
 	return (time1 - time0);
 }
 
