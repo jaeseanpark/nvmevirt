@@ -13,7 +13,7 @@
 #undef CONFIG_NVMEV_FAST_X86_IRQ_HANDLING
 
 #undef CONFIG_NVMEV_VERBOSE
-#define CONFIG_NVMEV_DEBUG
+#undef CONFIG_NVMEV_DEBUG
 #define CONFIG_NVMEV_DEBUG_VERBOSE
 #define CONFIG_NVMEV_COMP_DEBUG
 
@@ -64,7 +64,7 @@
 #define BYTE_TO_MB(b) ((b) >> 20)
 #define BYTE_TO_GB(b) ((b) >> 30)
 
-#define MS_PER_SEC(s) ((s)*1000)
+#define MS_PER_SEC(s) ((s) * 1000)
 #define US_PER_SEC(s) (MS_PER_SEC(s) * 1000)
 #define NS_PER_SEC(s) (US_PER_SEC(s) * 1000)
 
