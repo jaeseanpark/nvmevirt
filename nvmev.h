@@ -16,6 +16,7 @@
 #undef CONFIG_NVMEV_DEBUG
 #define CONFIG_NVMEV_DEBUG_VERBOSE
 #define CONFIG_NVMEV_COMP_DEBUG
+#define COMPRESSION
 
 /*************************/
 #define NVMEV_DRV_NAME "NVMeVirt"
